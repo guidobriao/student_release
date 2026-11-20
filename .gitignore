@@ -4,15 +4,17 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 .idea/
+
 # Dataset e risultati: da non versionare
 data/
 results/
 
-# File locali, non versionati
+# File locali e slide non versionate
 requirements-dev.txt
 ML_LAB_PART_1_MANUAL_V2.pdf
+Machine_Learning_Slides_V3.pdf
 
-# materiale sottomissione - non versionare
-group117/declarations/
-group117/README_SUBMISSION.txt
+# Materiale sottomissione - non versionare
+Lab Sessions/Project Part 1 - Regression I/student_release/declarations/
+Lab Sessions/Project Part 1 - Regression I/student_release/README_SUBMISSION.txt
 declaration_templates/

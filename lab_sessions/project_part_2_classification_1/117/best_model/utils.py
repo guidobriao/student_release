@@ -4,20 +4,22 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-NUMERIC_BASE_COLS = ["SST", "UI", "YDOY"]
-CHL_COLS = ["CHL", "CHL_uncertainty"]
 SEASON_CATEGORIES = ["Winter", "Spring", "Summer", "Fall"]
 CLUSTER_CATEGORIES = [0, 1, 2, 3, 4, 5]
+EPS = 1e-3
 
 
 def parse_input_dataframe(source: str | Path | pd.DataFrame) -> pd.DataFrame:
-    """Load an .xlsx file (or accept a DataFrame) and sort explicitly by Date."""
+    """Load a .csv or .xlsx file (or DataFrame) and sort explicitly by Date and spatial_cluster."""
     if isinstance(source, pd.DataFrame):
         df = source.copy()
     else:
         path = Path(source)
-        xls = pd.ExcelFile(path)
-        df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
+        if path.suffix.lower() == ".csv":
+            df = pd.read_csv(path)
+        else:
+            xls = pd.ExcelFile(path, engine="openpyxl")
+            df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
 
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
@@ -26,53 +28,73 @@ def parse_input_dataframe(source: str | Path | pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_explicit_features(
-    df: pd.DataFrame,
-    chl_fill_values: dict[str, float] | None = None,
-) -> tuple[np.ndarray, list[str], dict[str, float]]:
-    """Explicitly construct numeric feature matrix X using Pandas and NumPy only."""
+def _compute_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     if "Date" in work.columns:
-        work["Date"] = pd.to_datetime(work["Date"], errors="coerce")
-        sort_cols = ["Date", "spatial_cluster"] if "spatial_cluster" in work.columns else ["Date"]
-        work = work.sort_values(sort_cols).reset_index(drop=True)
+        dt = pd.to_datetime(work["Date"], errors="coerce")
+        doy = dt.dt.dayofyear.to_numpy(dtype=float)
+        work["sin_doy"] = np.sin(2.0 * np.pi * doy / 365.0)
+    else:
+        work["sin_doy"] = 0.0
 
-    if chl_fill_values is None:
-        chl_fill_values = {}
-        for col in CHL_COLS:
-            med = float(work[col].median()) if col in work.columns and work[col].notna().any() else 0.0
-            chl_fill_values[col] = med
+    chl = pd.to_numeric(work["CHL"], errors="coerce").to_numpy(dtype=float) if "CHL" in work.columns else np.full(len(work), np.nan)
+    chl_unc = (
+        pd.to_numeric(work["CHL_uncertainty"], errors="coerce").to_numpy(dtype=float)
+        if "CHL_uncertainty" in work.columns
+        else np.full(len(work), np.nan)
+    )
+
+    work["log1p_chl"] = np.log1p(np.clip(chl, a_min=0.0, a_max=None))
+    work["log1p_chl_unc"] = np.log1p(np.clip(chl_unc, a_min=0.0, a_max=None))
+    work["chl_snr"] = chl / (chl_unc + EPS)
+    return work
+
+
+def build_explicit_features(
+    df: pd.DataFrame,
+    fill_stats: dict[str, float] | None = None,
+) -> tuple[np.ndarray, list[str], dict[str, float]]:
+    """Explicitly construct numeric feature matrix X using Pandas and NumPy only."""
+    work = parse_input_dataframe(df)
+    work = _compute_derived_columns(work)
+
+    imputable_cols = ["CHL", "CHL_uncertainty", "log1p_chl", "log1p_chl_unc", "chl_snr"]
+    if fill_stats is None:
+        fill_stats = {}
+        for col in imputable_cols:
+            s = pd.to_numeric(work[col], errors="coerce")
+            fill_stats[col] = float(s.median()) if s.notna().any() else 0.0
 
     columns: list[pd.Series] = []
     feature_names: list[str] = []
 
-    # Missingness indicators + explicit median fill for CHL and CHL_uncertainty
-    for col in CHL_COLS:
-        raw_series = work[col] if col in work.columns else pd.Series(np.nan, index=work.index, dtype=float)
-        is_missing = raw_series.isna().astype(float)
-        filled = raw_series.fillna(chl_fill_values[col]).astype(float)
-        columns.extend([is_missing, filled])
-        feature_names.extend([f"{col}_is_missing", f"{col}_filled"])
+    chl_raw = pd.to_numeric(work["CHL"], errors="coerce") if "CHL" in work.columns else pd.Series(np.nan, index=work.index)
+    columns.append(chl_raw.isna().astype(float))
+    feature_names.append("CHL_is_missing")
 
-    # Continuous / cyclic numeric features
-    for col in NUMERIC_BASE_COLS:
-        s = work[col].astype(float) if col in work.columns else pd.Series(0.0, index=work.index, dtype=float)
-        s = s.fillna(0.0)
-        columns.append(s)
+    for col in imputable_cols:
+        s = pd.to_numeric(work[col], errors="coerce") if col in work.columns else pd.Series(np.nan, index=work.index)
+        columns.append(s.fillna(fill_stats[col]).astype(float))
+        feature_names.append(f"{col}_clean")
+
+    columns.append(pd.to_numeric(work["sin_doy"], errors="coerce").fillna(0.0).astype(float))
+    feature_names.append("sin_doy")
+
+    for col in ["SST", "UI", "YDOY"]:
+        s = pd.to_numeric(work[col], errors="coerce") if col in work.columns else pd.Series(0.0, index=work.index)
+        columns.append(s.fillna(0.0).astype(float))
         feature_names.append(col)
 
-    # Explicit one-hot encoding for Season and spatial_cluster
-    season_series = work["Season"].astype(str) if "Season" in work.columns else pd.Series("", index=work.index)
+    season_s = work["Season"].astype(str) if "Season" in work.columns else pd.Series("", index=work.index)
     for cat in SEASON_CATEGORIES:
-        columns.append((season_series == cat).astype(float))
+        columns.append((season_s == cat).astype(float))
         feature_names.append(f"season_{cat}")
 
-    cluster_series = work["spatial_cluster"] if "spatial_cluster" in work.columns else pd.Series(-1, index=work.index)
+    cluster_s = work["spatial_cluster"] if "spatial_cluster" in work.columns else pd.Series(-1, index=work.index)
     for cl in CLUSTER_CATEGORIES:
-        columns.append((cluster_series == cl).astype(float))
+        columns.append((cluster_s == cl).astype(float))
         feature_names.append(f"cluster_{cl}")
 
     X_df = pd.concat(columns, axis=1)
     X_df.columns = feature_names
-    X = X_df.to_numpy(dtype=float)
-    return X, feature_names, chl_fill_values
+    return X_df.to_numpy(dtype=float), feature_names, fill_stats

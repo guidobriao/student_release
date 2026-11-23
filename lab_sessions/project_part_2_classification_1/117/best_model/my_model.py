@@ -22,7 +22,7 @@ def predict(model: dict[str, Any], day_and_lag_features_df: pd.DataFrame) -> np.
         raise ValueError("day_and_lag_features_df must be a non-empty pandas DataFrame")
 
     df_copy = day_and_lag_features_df.copy(deep=True)
-    X_raw, _, _ = build_explicit_features(df_copy, chl_fill_values=model["chl_fill_values"])
+    X_raw, _, _ = build_explicit_features(df_copy, fill_stats=model["fill_stats"])
 
     mean = np.asarray(model["scaler_mean"], dtype=float)
     scale = np.asarray(model["scaler_scale"], dtype=float)
@@ -39,6 +39,6 @@ def predict(model: dict[str, Any], day_and_lag_features_df: pd.DataFrame) -> np.
 
 
 def predict_from_xlsx(model: dict[str, Any], xlsx_path: str | Path) -> np.ndarray:
-    """Helper to parse an .xlsx file (without requiring HAB) and run prediction."""
+    """Parse an .xlsx file (without requiring HAB) and run prediction."""
     df = parse_input_dataframe(xlsx_path)
     return predict(model, df)

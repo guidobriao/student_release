@@ -19,11 +19,16 @@ def load_task1_data(path: Path) -> pd.DataFrame:
 
 def main() -> None:
     script_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd()
     candidates = [
+        script_dir.parent / "data" / "classification_task1_train.xlsx",
+        script_dir.parent / "data" / "classification_task1_train.csv",
         script_dir / "data" / "classification_task1_train.xlsx",
         script_dir / "data" / "classification_task1_train.csv",
-        script_dir / "classification_task1_train.xlsx",
-        script_dir / "classification_task1_train.csv",
+        cwd / "data" / "classification_task1_train.xlsx",
+        cwd / "data" / "classification_task1_train.csv",
+        cwd / "lab_sessions" / "project_part_2_classification_1" / "data" / "classification_task1_train.xlsx",
+        cwd / "lab_sessions" / "project_part_2_classification_1" / "data" / "classification_task1_train.csv",
     ]
     data_path = next((p for p in candidates if p.exists()), None)
     if data_path is None:

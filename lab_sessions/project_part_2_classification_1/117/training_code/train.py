@@ -3,13 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 import pickle
 import sys
+import warnings
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
+
+warnings.filterwarnings("ignore")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BEST_MODEL_DIR = PROJECT_ROOT / "best_model"
@@ -29,37 +33,48 @@ def compute_standardizer(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def build_candidates() -> dict[str, object]:
     return {
         "logistic_regression": LogisticRegression(
-            C=0.5, max_iter=1000, class_weight="balanced", random_state=42
+            C=2.0, max_iter=1000, class_weight="balanced", random_state=42
         ),
-        "mlp_classifier": MLPClassifier(
+        "mlp_no_early_stopping": MLPClassifier(
             hidden_layer_sizes=(32, 16),
-            activation="relu",
-            alpha=1e-2,
+            alpha=0.5,
+            early_stopping=False,
             max_iter=500,
-            early_stopping=True,
-            validation_fraction=0.15,
+            random_state=42,
+        ),
+        "svc_rbf": SVC(
+            C=0.5, kernel="rbf", probability=True, class_weight="balanced", random_state=42
+        ),
+        "random_forest": RandomForestClassifier(
+            n_estimators=200,
+            max_depth=3,
+            min_samples_leaf=5,
+            class_weight="balanced",
             random_state=42,
         ),
         "hist_gradient_boosting": HistGradientBoostingClassifier(
-            max_iter=200,
-            learning_rate=0.05,
-            max_depth=4,
-            class_weight="balanced",
+            learning_rate=0.03,
+            max_depth=2,
+            min_samples_leaf=20,
+            max_iter=150,
             random_state=42,
         ),
     }
 
 
+def _complete_rows_mask(df: pd.DataFrame) -> pd.Series:
+    required = [col for col in ("CHL", "CHL_uncertainty") if col in df.columns]
+    if not required:
+        return pd.Series(True, index=df.index)
+    return df[required].notna().all(axis=1)
+
+
 def main() -> None:
     data_candidates = [
-        PROJECT_ROOT / "data" / "classification_task1_train.xlsx",
-        PROJECT_ROOT / "classification_task1_train.xlsx",
-        PROJECT_ROOT / "data" / "classification_task1_train.csv",
-        PROJECT_ROOT / "classification_task1_train.csv",
         PROJECT_ROOT.parent / "data" / "classification_task1_train.xlsx",
-        PROJECT_ROOT.parent / "classification_task1_train.xlsx",
+        PROJECT_ROOT / "data" / "classification_task1_train.xlsx",
         PROJECT_ROOT.parent / "data" / "classification_task1_train.csv",
-        PROJECT_ROOT.parent / "classification_task1_train.csv",
+        PROJECT_ROOT / "data" / "classification_task1_train.csv",
     ]
     data_path = next((p for p in data_candidates if p.exists()), None)
     if data_path is None:
@@ -69,54 +84,61 @@ def main() -> None:
     if "HAB" not in df.columns:
         raise ValueError("Training dataset is missing target column 'HAB'")
 
-    # Chronological validation split (2013-2018 train, 2019-2020 validation)
-    train_mask = df["Year"] <= 2018
-    val_mask = df["Year"] > 2018
+    folds = [
+        (df["Year"] <= 2016, (df["Year"] >= 2017) & (df["Year"] <= 2018)),
+        (df["Year"] <= 2018, df["Year"] == 2019),
+        (df["Year"] <= 2019, df["Year"] == 2020),
+    ]
 
-    df_train = df.loc[train_mask].reset_index(drop=True)
-    df_val = df.loc[val_mask].reset_index(drop=True)
-    y_train = df_train["HAB"].to_numpy(dtype=int)
-    y_val = df_val["HAB"].to_numpy(dtype=int)
+    candidate_names = list(build_candidates().keys())
+    cv_scores: dict[str, float] = {}
 
-    X_train_raw, feature_names, chl_fill_values = build_explicit_features(df_train, chl_fill_values=None)
-    mean, scale = compute_standardizer(X_train_raw)
-    X_train = (X_train_raw - mean) / scale
+    for name in candidate_names:
+        fold_aucs_comp: list[float] = []
+        fold_aucs_all: list[float] = []
+        for tr_mask, va_mask in folds:
+            tr_df = df.loc[tr_mask & _complete_rows_mask(df)].copy()
+            va_df = df.loc[va_mask].copy()
 
-    X_val_raw, _, _ = build_explicit_features(df_val, chl_fill_values=chl_fill_values)
-    X_val = (X_val_raw - mean) / scale
-    val_complete_mask = df_val[["CHL", "CHL_uncertainty"]].notna().all(axis=1).to_numpy()
+            X_tr_raw, _, fill_stats = build_explicit_features(tr_df, fill_stats=None)
+            mean, scale = compute_standardizer(X_tr_raw)
+            X_tr = (X_tr_raw - mean) / scale
+            y_tr = tr_df["HAB"].to_numpy(dtype=int)
 
-    candidates = build_candidates()
-    scores: dict[str, float] = {}
+            X_va_raw, _, _ = build_explicit_features(va_df, fill_stats=fill_stats)
+            X_va = (X_va_raw - mean) / scale
+            y_va = va_df["HAB"].to_numpy(dtype=int)
 
-    for name, clf in candidates.items():
-        clf.fit(X_train, y_train)
-        probs_all = clf.predict_proba(X_val)[:, 1]
-        preds_all = (probs_all >= 0.5).astype(int)
+            clf = build_candidates()[name]
+            clf.fit(X_tr, y_tr)
+            probs = (
+                clf.predict_proba(X_va)[:, 1]
+                if hasattr(clf, "predict_proba")
+                else clf.decision_function(X_va)
+            )
 
-        auc_all = roc_auc_score(y_val, probs_all)
-        auc_complete = roc_auc_score(y_val[val_complete_mask], probs_all[val_complete_mask])
-        f1 = f1_score(y_val, preds_all, zero_division=0)
-        prec = precision_score(y_val, preds_all, zero_division=0)
-        rec = recall_score(y_val, preds_all, zero_division=0)
+            fold_aucs_all.append(float(roc_auc_score(y_va, probs)))
+            comp_mask = _complete_rows_mask(va_df).to_numpy()
+            fold_aucs_comp.append(float(roc_auc_score(y_va[comp_mask], probs[comp_mask])))
 
-        # Select using complete-row validation AUC (matching complete 2021-2023 test set)
-        scores[name] = auc_complete
-        print(
-            f"[{name}] AUC(all)={auc_all:.4f} | AUC(complete)={auc_complete:.4f} | "
-            f"F1={f1:.4f} | Prec={prec:.4f} | Rec={rec:.4f}"
-        )
+        mean_all = float(np.mean(fold_aucs_all))
+        mean_comp = float(np.mean(fold_aucs_comp))
+        cv_scores[name] = mean_comp
+        print(f"[{name}] expanding CV AUC(all)={mean_all:.4f} | AUC(complete)={mean_comp:.4f}")
 
-    best_name = max(scores, key=scores.get)
-    print(f"\nSelected best model: {best_name} (complete-row val AUC={scores[best_name]:.4f})")
+    best_name = max(cv_scores, key=cv_scores.get)
+    print(f"\nSelected best model: {best_name} (expanding CV complete AUC={cv_scores[best_name]:.4f})")
 
-    # Refit selected model on full 2013-2020 dataset
-    X_full_raw, feature_names, final_chl_fills = build_explicit_features(df, chl_fill_values=None)
+    # Fit on complete training rows (matching Task 1 complete 2021-2023 test set)[cite: 14]
+    complete_df = df.loc[_complete_rows_mask(df)].copy()
+    X_full_raw, feature_names, final_fill_stats = build_explicit_features(
+        complete_df, fill_stats=None
+    )
     final_mean, final_scale = compute_standardizer(X_full_raw)
     X_full = (X_full_raw - final_mean) / final_scale
 
     final_clf = build_candidates()[best_name]
-    final_clf.fit(X_full, df["HAB"].to_numpy(dtype=int))
+    final_clf.fit(X_full, complete_df["HAB"].to_numpy(dtype=int))
 
     BEST_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     artifact = {
@@ -124,7 +146,7 @@ def main() -> None:
         "estimator": final_clf,
         "scaler_mean": final_mean,
         "scaler_scale": final_scale,
-        "chl_fill_values": final_chl_fills,
+        "fill_stats": final_fill_stats,
         "feature_names": feature_names,
     }
     out_path = BEST_MODEL_DIR / "model.pkl"
